@@ -211,6 +211,8 @@ jobs:
         env:
           HOST: ${{ secrets.vps_host }}
           USER: ${{ secrets.vps_user }}
+          PORT: ${{ inputs.port }}
+          RELAY_PORT: ${{ inputs.relay_port }}
         run: |
           ssh "$USER@$HOST" <<EOF
             echo "Tracker (127.0.0.1:$PORT):"
@@ -220,9 +222,6 @@ jobs:
               curl -sI -o /dev/null -w "  HTTP %{http_code} in %{time_total}s\n" --max-time 10 http://127.0.0.1:$RELAY_PORT
             fi
           EOF
-        env:
-          PORT: ${{ inputs.port }}
-          RELAY_PORT: ${{ inputs.relay_port }}
 
       - name: Health check (live public URL)
         env:
