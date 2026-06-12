@@ -1,0 +1,273 @@
+# ashbi-deploy — reusable VPS deploy workflow for camster91/* web apps.
+#
+# Other repos call this from their own .github/workflows/deploy.yml with:
+#   uses: camster91/ashbi-deploy/.github/workflows/deploy.yml@main
+#   with:
+#     project_name: my-app
+#     port: "3031"
+#     public_url: https://my-app.ashbi.ca
+#     compose_b64: <base64 of docker-compose.yml>
+#     env_b64: <base64 of .env>
+#   secrets:
+#     vps_ssh_key: ${{ secrets.VPS_SSH_KEY }}
+#     vps_host:    ${{ secrets.VPS_HOST }}
+#     vps_user:    ${{ secrets.VPS_USER }}
+#
+# What this does:
+#   1. SSH into the VPS as $vps_user@$vps_host
+#   2. Write docker-compose.yml + .env at /opt/projects/$project_name/
+#      (decoded from the b64 inputs to avoid YAML/heredoc nesting issues)
+#   3. docker compose build --no-cache + up -d
+#   4. Smoke test 127.0.0.1:$port
+#   5. Health check $public_url
+#   6. Write summary to GitHub Actions step summary
+#
+# Pattern matches the deploy-to-vps.sh script that's been used for
+# contraction-tracker since 2026-06. Caddy reverse-proxies the public
+# URL to 127.0.0.1:$port; the workflow assumes the Caddyfile block
+# already exists (or adds it via a separate ops task).
+#
+# Why base64: a docker-compose.yml is multi-line YAML. Inlining it in
+# a workflow's `env:` block means it gets nested in a `<<EOF` heredoc
+# inside an `ssh` call, and earlier drafts hit YAML/heredoc indentation
+# bugs (the inner heredoc body got captured as literal text). base64
+# sidesteps the whole problem.
+#
+# Why --no-cache but no --pull: the host's Docker build namespace
+# can't resolve registry-1.docker.io (worked around in 2026-06 by
+# building from local context). --no-cache forces a clean build so a
+# bad layer doesn't get pinned across deploys.
+
+name: Reusable Deploy
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: 'Project dir name on the VPS (under /opt/projects/). E.g. "contraction-tracker".'
+        required: true
+        type: string
+      port:
+        description: 'Host-side port the container publishes. Caddy reverse-proxies to 127.0.0.1:$port.'
+        required: true
+        type: string
+      public_url:
+        description: 'Public HTTPS URL. Used for the health check.'
+        required: true
+        type: string
+      compose_b64:
+        description: 'Base64-encoded docker-compose.yml. Decoded into /opt/projects/$project_name/docker-compose.yml on the host.'
+        required: true
+        type: string
+      env_b64:
+        description: 'Base64-encoded .env. Decoded into /opt/projects/$project_name/.env on the host.'
+        required: true
+        type: string
+      # Optional second project (e.g. paired relay). When set, the
+      # workflow treats this as a "deploy two compose files side by
+      # side" run. The relay is always rebuilt + restarted after the
+      # primary; smoke tests hit $port (primary) and $relay_port.
+      relay_project_name:
+        description: 'Optional relay project dir name. E.g. "contraction-tracker-relay".'
+        required: false
+        type: string
+        default: ''
+      relay_port:
+        description: 'Optional relay host-side port.'
+        required: false
+        type: string
+        default: ''
+      relay_compose_b64:
+        description: 'Base64-encoded relay docker-compose.yml.'
+        required: false
+        type: string
+        default: ''
+      relay_env_b64:
+        description: 'Base64-encoded relay .env.'
+        required: false
+        type: string
+        default: ''
+      environment_name:
+        description: 'Name of the GitHub environment to deploy into. Caddyfile and Caddy reload are environment-specific.'
+        required: false
+        type: string
+        default: 'production'
+    secrets:
+      vps_ssh_key:
+        description: 'SSH private key for root@$vps_host.'
+        required: true
+      vps_host:
+        description: 'VPS hostname or IP (e.g. "187.77.26.99" or "coolify").'
+        required: true
+      vps_user:
+        description: 'SSH user (usually "root").'
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.project_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.vps_ssh_key }}
+
+      - name: Add host to known_hosts
+        # Inline host keys for 187.77.26.99 (the only VPS in use as of
+        # 2026-06-12). Pulled via `ssh-keyscan -H 187.77.26.99`. Lines
+        # via printf so the YAML parser doesn't try to read the long
+        # base64 blobs as mapping keys. If you point this workflow at
+        # a different host, replace this step with `ssh-keyscan -H
+        # $vps_host >> ~/.ssh/known_hosts` — the GitHub Actions runner
+        # only blocks outbound port 22 when scanning would be blocked,
+        # and for hosts you control outbound is fine.
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' \
+            '187.77.26.99 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCgYjXktFXJXIW/HIMKIviTkt02MIyQ5APspS+MvtwuMmolV2VcAySIWowy9qHZvy5iLxI26LRk9Lr29xDLt0CcLOrW7+eHvedlE/AxBtpUhcftenhzLvmyX0ZXmtqfmv6JclwG/vU+zwEj2uawyPzbXNheoEGI8G5bIZ885QDQVyIYR8LzQDQinTaHc92fNY3cIeaOwoAYUlcRFbeXwl/Jm4SSUB0DnvrJXfOUbP3EBOcUXCFlSP1AYtAO9urvqs4rZ/DDFbcEY8Z+URsNFMc238SmmwNnmfTpS8qs0PoFq1Z8H0EMgqn4zohqMkIbp/1fRBPKPE/FC40GThkbFbLecooxfy/gFejipLKPLiYQW3ZDTYqddf8XWA/9z/EYrccr966vTdDBp71VAGBuHypS1NuxH/wL98hJ91EytWn0bzDZZ3k9b8sZ/GU+oGmH9LFyaoVnEzwGp+vVLH8jnvfmHg0s1dePr3MhzfFAzANut1oQ99PWUZWUQhwPUxdyqeE=' \
+            '187.77.26.99 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJlCcQfxZM13+CjrEnMZhgwyjVk36K342Yzhv/E3xm7GUNthegor0435SNre1t1W9GGYsHpSyEwQ7ceShAmBgC0=' \
+            >> ~/.ssh/known_hosts
+          echo "Added $(wc -l < ~/.ssh/known_hosts) known hosts"
+
+      - name: "Pre-deploy: clear fail2ban self-ban"
+        # fail2ban on the VPS sometimes bans the GitHub Actions runner
+        # after repeated SSH attempts. Detect + unban before the
+        # actual deploy SSH commands run.
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.vps_host }}
+          USER: ${{ secrets.vps_user }}
+        run: |
+          MY_IP=$(curl -sS --max-time 10 https://api.ipify.org || echo "")
+          if [ -z "$MY_IP" ]; then
+            echo "Could not determine runner IP; skipping fail2ban check"
+            exit 0
+          fi
+          echo "Runner IP: $MY_IP"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $USER@$HOST "fail2ban-client set sshd unbanip $MY_IP" || echo "fail2ban unban failed (probably not banned), continuing"
+
+      - name: Write docker-compose + .env on host
+        env:
+          HOST: ${{ secrets.vps_host }}
+          USER: ${{ secrets.vps_user }}
+          PROJECT_DIR: /opt/projects/${{ inputs.project_name }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+          RELAY_PROJECT_DIR: ${{ inputs.relay_project_name && format('/opt/projects/{0}', inputs.relay_project_name) || '' }}
+          RELAY_PROJECT_NAME: ${{ inputs.relay_project_name }}
+        run: |
+          ssh "$USER@$HOST" <<EOF
+            set -e
+            mkdir -p $PROJECT_DIR
+            echo '${{ inputs.compose_b64 }}' | base64 -d > $PROJECT_DIR/docker-compose.yml
+            echo '${{ inputs.env_b64 }}'       | base64 -d > $PROJECT_DIR/.env
+            if [ -n "$RELAY_PROJECT_DIR" ] && [ -n "${{ inputs.relay_compose_b64 }}" ]; then
+              mkdir -p $RELAY_PROJECT_DIR
+              echo '${{ inputs.relay_compose_b64 }}' | base64 -d > $RELAY_PROJECT_DIR/docker-compose.yml
+              echo '${{ inputs.relay_env_b64 }}'       | base64 -d > $RELAY_PROJECT_DIR/.env
+            fi
+            echo "Wrote compose + .env files:"
+            ls -la $PROJECT_DIR/
+            [ -n "$RELAY_PROJECT_DIR" ] && ls -la $RELAY_PROJECT_DIR/
+            echo "--- $PROJECT_NAME .env ---"
+            cat $PROJECT_DIR/.env
+            [ -n "$RELAY_PROJECT_NAME" ] && echo "--- $RELAY_PROJECT_NAME .env ---" && cat $RELAY_PROJECT_DIR/.env
+          EOF
+
+      - name: Build + restart containers
+        env:
+          HOST: ${{ secrets.vps_host }}
+          USER: ${{ secrets.vps_user }}
+          PROJECT_DIR: /opt/projects/${{ inputs.project_name }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+          RELAY_PROJECT_DIR: ${{ inputs.relay_project_name && format('/opt/projects/{0}', inputs.relay_project_name) || '' }}
+          RELAY_PROJECT_NAME: ${{ inputs.relay_project_name }}
+        run: |
+          ssh "$USER@$HOST" <<EOF
+            set -e
+            echo "Building $PROJECT_NAME..."
+            cd $PROJECT_DIR
+            docker compose build --no-cache
+            echo "Starting $PROJECT_NAME..."
+            docker compose up -d
+            if [ -n "$RELAY_PROJECT_DIR" ] && [ -f "$RELAY_PROJECT_DIR/docker-compose.yml" ]; then
+              echo "Building $RELAY_PROJECT_NAME..."
+              cd $RELAY_PROJECT_DIR
+              docker compose build --no-cache
+              echo "Starting $RELAY_PROJECT_NAME..."
+              docker compose up -d
+            fi
+            sleep 4
+            echo "--- Container status ---"
+            docker ps --filter "name=$PROJECT_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+          EOF
+
+      - name: Smoke test (localhost)
+        env:
+          HOST: ${{ secrets.vps_host }}
+          USER: ${{ secrets.vps_user }}
+        run: |
+          ssh "$USER@$HOST" <<EOF
+            echo "Tracker (127.0.0.1:$PORT):"
+            curl -sI -o /dev/null -w "  HTTP %{http_code} in %{time_total}s\n" --max-time 10 http://127.0.0.1:$PORT
+            if [ -n "$RELAY_PORT" ]; then
+              echo "Relay (127.0.0.1:$RELAY_PORT):"
+              curl -sI -o /dev/null -w "  HTTP %{http_code} in %{time_total}s\n" --max-time 10 http://127.0.0.1:$RELAY_PORT
+            fi
+          EOF
+        env:
+          PORT: ${{ inputs.port }}
+          RELAY_PORT: ${{ inputs.relay_port }}
+
+      - name: Health check (live public URL)
+        env:
+          PUBLIC_URL: ${{ inputs.public_url }}
+        run: |
+          sleep 5
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$PUBLIC_URL/")
+          echo "Public HTTP: $HTTP"
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Live site returned $HTTP"
+            exit 1
+          fi
+          # If the app has a /api/health endpoint, hit it too. Default-on
+          # but ignored if the endpoint 404s — apps without it just skip.
+          HEALTH=$(curl -s --max-time 10 "$PUBLIC_URL/api/health" || echo "")
+          if [ -n "$HEALTH" ] && ! echo "$HEALTH" | grep -q '404'; then
+            echo "Health: $HEALTH"
+            if ! echo "$HEALTH" | grep -q '"ok":true'; then
+              echo "::warning::Health endpoint didn't return ok:true: $HEALTH"
+            fi
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          PROJECT: ${{ inputs.project_name }}
+          RELAY: ${{ inputs.relay_project_name }}
+          PORT: ${{ inputs.port }}
+          PUBLIC_URL: ${{ inputs.public_url }}
+          TRIGGER: ${{ github.event_name }}
+          REASON: ${{ inputs.reason || '' }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## Deploy $PROJECT"
+            echo ""
+            echo "- **Project:**   $PROJECT"
+            echo "- **Port:**      $PORT"
+            echo "- **Public URL:** $PUBLIC_URL/"
+            if [ -n "$RELAY" ]; then echo "- **Relay:**     $RELAY"; fi
+            echo "- **Result:**    $JOB_STATUS"
+            echo ""
+            if [ -n "$REASON" ]; then
+              echo "Trigger: $TRIGGER ($REASON)"
+            else
+              echo "Trigger: $TRIGGER"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
