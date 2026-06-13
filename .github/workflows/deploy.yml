@@ -195,7 +195,10 @@ jobs:
             [ -n "$RELAY_PROJECT_DIR" ] && ls -la $RELAY_PROJECT_DIR/
             echo "--- $PROJECT_NAME .env ---"
             cat $PROJECT_DIR/.env
-            [ -n "$RELAY_PROJECT_NAME" ] && echo "--- $RELAY_PROJECT_NAME .env ---" && cat $RELAY_PROJECT_DIR/.env
+            if [ -n "$RELAY_PROJECT_NAME" ]; then
+              echo "--- $RELAY_PROJECT_NAME .env ---"
+              cat $RELAY_PROJECT_DIR/.env
+            fi
           EOF
 
       - name: Build + restart containers
