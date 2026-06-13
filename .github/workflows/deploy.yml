@@ -215,12 +215,64 @@ jobs:
             echo "Building $PROJECT_NAME..."
             cd $PROJECT_DIR
             docker compose build --no-cache
+            # Remove any pre-existing container with the same name as
+            # a service in this compose. Common case: the app was
+            # previously deployed via the old `docker run` path
+            # (no compose labels), and `docker compose up -d` refuses
+            # to "adopt" a label-less container with the same name
+            # ("Conflict. The container name ... is already in use").
+            # `docker compose down` would only remove containers this
+            # compose previously created, so we have to do it
+            # explicitly. Reads container_name from the compose file
+            # (defaults to the service key) and force-removes each.
+            echo "Pre-cleaning any externally-created containers..."
+            # Common case: the app was previously deployed via the
+            # old `docker run` path (no compose labels), and
+            # `docker compose up -d` refuses to adopt a label-less
+            # container with the same name ("Conflict. The container
+            # name ... is already in use"). `docker compose down`
+            # only removes containers this compose previously created,
+            # so we remove them explicitly. The container name is
+            # either declared via `container_name:` in the compose or
+            # defaults to the service key. We use grep + yq (already
+            # on the host) to extract the names. If the host doesn't
+            # have yq, fall back to awk on the container_name lines.
+            if command -v yq >/dev/null 2>&1 && [ -f docker-compose.yml ]; then
+              yq -r '.services | to_entries[] | "  docker rm -f \(.value.container_name // .key) (if exists)"' docker-compose.yml
+            elif [ -f docker-compose.yml ]; then
+              # Fallback: extract `container_name: <name>` from each
+              # service. This is best-effort (doesn't infer the
+              # default service key) but covers the lull and
+              # contraction-tracker cases where the compose declares
+              # `container_name:` explicitly.
+              awk '/^[[:space:]]*container_name:[[:space:]]*/{ gsub(/^[[:space:]]*container_name:[[:space:]]*/, ""); print "  docker rm -f " $0 " (if exists)" }' docker-compose.yml
+            fi | while read -r line; do
+                cmd="${line#  }"
+                if [ "${cmd#docker rm -f }" != "$cmd" ]; then
+                  name="${cmd#docker rm -f }"
+                  name="${name% (if exists)}"
+                  docker rm -f "$name" 2>/dev/null || true
+                fi
+              done
             echo "Starting $PROJECT_NAME..."
             docker compose up -d
             if [ -n "$RELAY_PROJECT_DIR" ] && [ -f "$RELAY_PROJECT_DIR/docker-compose.yml" ]; then
               echo "Building $RELAY_PROJECT_NAME..."
               cd $RELAY_PROJECT_DIR
               docker compose build --no-cache
+              echo "Pre-cleaning relay containers..."
+              if command -v yq >/dev/null 2>&1 && [ -f docker-compose.yml ]; then
+                yq -r '.services | to_entries[] | "  docker rm -f \(.value.container_name // .key) (if exists)"' docker-compose.yml
+              elif [ -f docker-compose.yml ]; then
+                awk '/^[[:space:]]*container_name:[[:space:]]*/{ gsub(/^[[:space:]]*container_name:[[:space:]]*/, ""); print "  docker rm -f " $0 " (if exists)" }' docker-compose.yml
+              fi | while read -r line; do
+                cmd="${line#  }"
+                if [ "${cmd#docker rm -f }" != "$cmd" ]; then
+                  name="${cmd#docker rm -f }"
+                  name="${name% (if exists)}"
+                  docker rm -f "$name" 2>/dev/null || true
+                fi
+              done
               echo "Starting $RELAY_PROJECT_NAME..."
               docker compose up -d
             fi
