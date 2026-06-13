@@ -92,6 +92,51 @@ on:
         required: false
         type: string
         default: 'production'
+      # Deploy mode. Default 'build' = current behavior (compose build
+      # --no-cache + up -d). 'pull' skips the build step entirely and
+      # is for apps whose compose has no `build:` block (the image is
+      # built + pushed by a separate workflow, e.g. build-and-push.yml,
+      # and the host only runs it). Saves ~5s per deploy and removes
+      # the misleading "Build" log section for pull-only apps.
+      #
+      # 'pull' also enables an automatic `docker compose pull` before
+      # `up -d` so a same-tag re-push (common in CI) actually gets
+      # picked up — `docker compose up -d` alone only pulls when the
+      # local image is missing, which means a tag that didn't change
+      # would silently stay on the old layers. Set `pull_always: false`
+      # below to opt out of that.
+      deploy_mode:
+        description: '"build" (default) = compose build --no-cache + up -d. "pull" = skip build, up -d (image is pre-built by CI).'
+        required: false
+        type: string
+        default: 'build'
+      # Override the default `docker compose pull` behavior in
+      # deploy_mode=pull. Default true: always pull before up -d so
+      # same-tag re-pushes are picked up. Set false to use the
+      # compose's "pull only when missing" default. Ignored when
+      # deploy_mode=build.
+      pull_always:
+        description: 'In deploy_mode=pull, run `docker compose pull` before `up -d`. Default true. Ignored in build mode.'
+        required: false
+        type: string
+        default: 'true'
+      # Optional image tag override. When set, the reusable does an
+      # in-place sed on the decoded docker-compose.yml to replace
+      # the tag portion of the FIRST `image:` line with this value.
+      # The image: prefix (registry/repo) is preserved; only the
+      # tag (everything after the last `:`) is replaced. Use this
+      # when you want to pin a SHA or override `:latest` for a
+      # specific deploy without re-baking compose_b64.
+      #
+      # Refuses to run on a compose with more than one `image:` line
+      # (multi-service pulls) — for those, bake the tag into
+      # compose_b64 directly. Animal-farts is the canonical
+      # use case: single-service, SHA-pinned.
+      image_tag:
+        description: 'Optional image tag override (e.g. "ea83e36" or "v1.2.3"). Replaces the tag on the first `image:` line in the decoded compose.'
+        required: false
+        type: string
+        default: ''
     secrets:
       vps_ssh_key:
         description: 'SSH private key for root@$vps_host.'
@@ -179,6 +224,7 @@ jobs:
           PROJECT_NAME: ${{ inputs.project_name }}
           RELAY_PROJECT_DIR: ${{ inputs.relay_project_name && format('/opt/projects/{0}', inputs.relay_project_name) || '' }}
           RELAY_PROJECT_NAME: ${{ inputs.relay_project_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
           ssh "$USER@$HOST" <<EOF
             set -e
@@ -189,6 +235,55 @@ jobs:
               mkdir -p $RELAY_PROJECT_DIR
               echo '${{ inputs.relay_compose_b64 }}' | base64 -d > $RELAY_PROJECT_DIR/docker-compose.yml
               echo '${{ inputs.relay_env_b64 }}'       | base64 -d > $RELAY_PROJECT_DIR/.env
+            fi
+            # Apply image_tag override (single-service composes only).
+            # The input replaces the tag portion of the FIRST `image:`
+            # line in $PROJECT_DIR/docker-compose.yml. Refuses to run
+            # on multi-service composes to avoid silently rewriting the
+            # wrong line — for those, the caller pre-bakes the tag in
+            # compose_b64. The relay's compose (if any) is not
+            # touched: the input is intentionally a single-image knob.
+            if [ -n "$IMAGE_TAG" ]; then
+              IMAGE_COUNT=\$(grep -cE '^[[:space:]]*image:' "$PROJECT_DIR/docker-compose.yml" || true)
+              if [ "\$IMAGE_COUNT" -gt 1 ]; then
+                echo "::error::image_tag is set but $PROJECT_DIR/docker-compose.yml has \$IMAGE_COUNT image: lines."
+                echo "::error::image_tag only supports single-service composes. Bake the tag into compose_b64 instead."
+                exit 1
+              fi
+              if [ "\$IMAGE_COUNT" -eq 0 ]; then
+                echo "::error::image_tag is set but no image: line found in $PROJECT_DIR/docker-compose.yml."
+                exit 1
+              fi
+              echo "Applying image_tag override: \$IMAGE_TAG"
+              # Replace the tag portion (everything after the final
+              # `:`) on the first image: line. Preserves the
+              # registry/repo prefix and any leading whitespace.
+              # The capture group: (image: <registry/repo>:). Sub
+              # rewrites the suffix to the new tag. If the existing
+              # image has no tag (e.g. `image: nginx`), the suffix is
+              # empty and we add `:TAG` to make it explicit.
+              python3 -c "
+              import re, sys
+              path = '$PROJECT_DIR/docker-compose.yml'
+              tag = sys.argv[1]
+              with open(path) as f:
+                  content = f.read()
+              def repl(m):
+                  prefix = m.group(1)
+                  suffix = m.group(2)
+                  return prefix + tag
+              new_content, n = re.subn(r'(^[ \t]*image:[ \t]+[\w./\-]+:)([^\s#]*)?', repl, content, count=1, flags=re.MULTILINE)
+              if n == 0:
+                  # No tag on the existing image — append :TAG
+                  new_content, n = re.subn(r'(^[ \t]*image:[ \t]+[\w./\-]+)([ \t]*)$', r'\1:' + tag + r'\2', content, count=1, flags=re.MULTILINE)
+              if n == 0:
+                  print('::error::Failed to apply image_tag: no match for the image: line.', file=sys.stderr)
+                  sys.exit(1)
+              with open(path, 'w') as f:
+                  f.write(new_content)
+              "
+              echo "image: line after override:"
+              grep -E '^[[:space:]]*image:' "$PROJECT_DIR/docker-compose.yml"
             fi
             echo "Wrote compose + .env files:"
             ls -la $PROJECT_DIR/
@@ -209,12 +304,50 @@ jobs:
           PROJECT_NAME: ${{ inputs.project_name }}
           RELAY_PROJECT_DIR: ${{ inputs.relay_project_name && format('/opt/projects/{0}', inputs.relay_project_name) || '' }}
           RELAY_PROJECT_NAME: ${{ inputs.relay_project_name }}
+          # deploy_mode: 'build' (default) or 'pull'. In 'build' mode
+          # the host runs `docker compose build --no-cache` (the
+          # original behavior). In 'pull' mode the build step is
+          # skipped — the image is expected to be pre-built and
+          # pushed to a registry by the caller's CI. The relay
+          # always uses the same mode as the primary for now (a
+          # caller with a built-from-source relay can pass the
+          # same deploy_mode=build for that step too; future
+          # versions may add a separate relay_deploy_mode).
+          DEPLOY_MODE: ${{ inputs.deploy_mode }}
+          # pull_always: 'true' (default) or 'false'. Only honored
+          # in deploy_mode=pull. When 'true', runs `docker compose
+          # pull` before `up -d` so a same-tag re-push is actually
+          # picked up. `up -d` alone only pulls when the local
+          # image is missing.
+          PULL_ALWAYS: ${{ inputs.pull_always }}
         run: |
           ssh "$USER@$HOST" <<EOF
             set -e
-            echo "Building $PROJECT_NAME..."
+            # Validate deploy_mode. Anything other than 'build' or
+            # 'pull' is a caller typo — fail fast with a clear
+            # message rather than silently falling through to build.
+            case "\$DEPLOY_MODE" in
+              build|pull) ;;
+              *) echo "::error::Invalid deploy_mode: '\$DEPLOY_MODE'. Must be 'build' or 'pull'."; exit 1 ;;
+            esac
+            case "\$PULL_ALWAYS" in
+              true|false) ;;
+              *) echo "::error::Invalid pull_always: '\$PULL_ALWAYS'. Must be 'true' or 'false'."; exit 1 ;;
+            esac
+            echo "Deploy mode: \$DEPLOY_MODE  pull_always: \$PULL_ALWAYS"
             cd $PROJECT_DIR
-            docker compose build --no-cache
+            if [ "\$DEPLOY_MODE" = "build" ]; then
+              echo "Building $PROJECT_NAME..."
+              docker compose build --no-cache
+            else
+              echo "Skipping build for $PROJECT_NAME (deploy_mode=pull)."
+              if [ "\$PULL_ALWAYS" = "true" ]; then
+                echo "Pulling latest image for $PROJECT_NAME..."
+                docker compose pull
+              else
+                echo "Skipping pull (pull_always=false); up -d will pull only if local image is missing."
+              fi
+            fi
             # Remove any pre-existing container with the same name as
             # a service in this compose. Common case: the app was
             # previously deployed via the old `docker run` path
@@ -226,17 +359,6 @@ jobs:
             # explicitly. Reads container_name from the compose file
             # (defaults to the service key) and force-removes each.
             echo "Pre-cleaning any externally-created containers..."
-            # Common case: the app was previously deployed via the
-            # old `docker run` path (no compose labels), and
-            # `docker compose up -d` refuses to adopt a label-less
-            # container with the same name ("Conflict. The container
-            # name ... is already in use"). `docker compose down`
-            # only removes containers this compose previously created,
-            # so we remove them explicitly. The container name is
-            # declared via `container_name:` in the compose (the
-            # reusable currently doesn't handle the default-to-service-
-            # key case — callers should declare container_name
-            # explicitly).
             if [ -f docker-compose.yml ]; then
               grep -E '^[[:space:]]*container_name:' docker-compose.yml \
                 | sed -E 's/^[[:space:]]*container_name:[[:space:]]*//; s/[[:space:]]*$//' \
@@ -247,9 +369,17 @@ jobs:
             echo "Starting $PROJECT_NAME..."
             docker compose up -d
             if [ -n "$RELAY_PROJECT_DIR" ] && [ -f "$RELAY_PROJECT_DIR/docker-compose.yml" ]; then
-              echo "Building $RELAY_PROJECT_NAME..."
               cd $RELAY_PROJECT_DIR
-              docker compose build --no-cache
+              if [ "\$DEPLOY_MODE" = "build" ]; then
+                echo "Building $RELAY_PROJECT_NAME..."
+                docker compose build --no-cache
+              else
+                echo "Skipping build for $RELAY_PROJECT_NAME (deploy_mode=pull)."
+                if [ "\$PULL_ALWAYS" = "true" ]; then
+                  echo "Pulling latest image for $RELAY_PROJECT_NAME..."
+                  docker compose pull
+                fi
+              fi
               echo "Pre-cleaning relay containers..."
               if [ -f docker-compose.yml ]; then
                 grep -E '^[[:space:]]*container_name:' docker-compose.yml \
@@ -333,6 +463,8 @@ jobs:
           PUBLIC_URL: ${{ inputs.public_url }}
           TRIGGER: ${{ github.event_name }}
           REASON: ${{ inputs.reason || '' }}
+          DEPLOY_MODE: ${{ inputs.deploy_mode }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
           JOB_STATUS: ${{ job.status }}
         run: |
           {
@@ -341,6 +473,8 @@ jobs:
             echo "- **Project:**   $PROJECT"
             echo "- **Port:**      $PORT"
             echo "- **Public URL:** $PUBLIC_URL/"
+            echo "- **Mode:**      $DEPLOY_MODE"
+            if [ -n "$IMAGE_TAG" ]; then echo "- **Image tag:** $IMAGE_TAG (override)"; fi
             if [ -n "$RELAY" ]; then echo "- **Relay:**     $RELAY"; fi
             echo "- **Result:**    $JOB_STATUS"
             echo ""
